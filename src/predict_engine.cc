@@ -279,7 +279,7 @@ bool PredictDb::CreateMetadata() {
 bool PredictDb::Lookup(const string& query, int max_candidates) {
   DLOG(INFO) << "PredictDb::Lookup query='" << query << "'";
 
-  if (!loaded()) {
+  if (!ready_.load()) {
     DLOG(INFO) << "Lookup: db not loaded yet";
     return false;
   }
@@ -384,7 +384,7 @@ void PredictDb::UpdatePredict(const string& key,
   // 序列化写入以避免同进程并发问题
   std::lock_guard<std::mutex> write_lock(write_mutex_);
 
-  if (!loaded()) {
+  if (!ready_.load()) {
     return;
   }
 
@@ -437,7 +437,7 @@ void PredictDb::UpdatePredict(const string& key,
   MetaUpdate("/tick", std::to_string(current_tick));
 
   // 记录输入样本用于 EMA 活跃度估算（仅非删除操作）
-  if (!todelete && loaded()) {
+  if (!todelete) {
     time_t current_time = std::time(nullptr);
 
     // 有历史记录时才更新 EMA
