@@ -73,7 +73,7 @@ bool PredictEngine::Predict(Context* ctx, const string& context_query) {
       return true;
     }
     DLOG(INFO) << "PredictEngine::Predict no legacy candidates for '"
-                << context_query << "'";
+               << context_query << "'";
     Clear();
     return false;
   }
@@ -142,7 +142,7 @@ PredictEngine* PredictEngineComponent::Create(const Ticket& ticket) {
     auto* config = schema->config();
     if (config->GetBool("predictor/legacy_mode", &legacy_mode)) {
       DLOG(INFO) << "predictor/legacy_mode: "
-                  << (legacy_mode ? "true" : "false");
+                 << (legacy_mode ? "true" : "false");
     }
     if (config->GetString("predictor/predictdb", &level_db_name)) {
       DLOG(INFO) << "custom predictor/predictdb" << level_db_name;
@@ -169,7 +169,7 @@ PredictEngine* PredictEngineComponent::Create(const Ticket& ticket) {
       return nullptr;
     }
     return new PredictEngine(nullptr, legacy_db, true, max_iterations,
-                            max_candidates);
+                             max_candidates);
   }
 
   the<ResourceResolver> resolver(Service::instance().CreateResourceResolver(
@@ -179,7 +179,7 @@ PredictEngine* PredictEngineComponent::Create(const Ticket& ticket) {
 
   if (level_db) {
     auto* engine = new PredictEngine(level_db, nullptr, false, max_iterations,
-                                    max_candidates);
+                                     max_candidates);
 
     // 读取并设置清理配置
     CleanupConfig cleanup_config;
@@ -187,7 +187,7 @@ PredictEngine* PredictEngineComponent::Create(const Ticket& ticket) {
       auto* config = schema->config();
       config->GetBool("predictor/cleanup/enabled", &cleanup_config.enabled);
       config->GetInt("predictor/cleanup/expire_days",
-                    &cleanup_config.expire_days);
+                     &cleanup_config.expire_days);
       config->GetInt("predictor/cleanup/min_usage", &cleanup_config.min_usage);
 
       DLOG(INFO) << "cleanup config: enabled=" << cleanup_config.enabled
