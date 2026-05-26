@@ -6,7 +6,6 @@
 #include <rime/component.h>
 #include <rime/dict/user_db.h>
 #include <rime/dict/level_db.h>
-#include <msgpack.hpp>
 #include <leveldb/db.h>
 #include <mutex>
 #include <shared_mutex>
@@ -71,14 +70,7 @@ class DecayTable {
   }
 };
 
-// 旧数据格式 (msgpack，用于迁移)
-struct LegacyPrediction {
-  std::string word;
-  double count;
-  MSGPACK_DEFINE(word, count);
-};
-
-// 新数据格式：标准 userdb 格式 (c= commits, d= dee, t= tick)
+// 数据格式：标准 userdb 格式 (c= commits, d= dee, t= tick)
 // key 格式：prefix<TAB>predict_word (如 "你\t 好")
 // value 格式：c=5 d=100.0 t=12345
 struct PredictEntry {
@@ -196,14 +188,6 @@ struct PredictEntry {
   }
 };
 
-// 迁移统计信息
-struct MigrationStats {
-  int legacy_count = 0;        // 旧格式条目数
-  int new_count = 0;           // 新格式条目数
-  int mismatch_count = 0;      // 不匹配条目数
-  int sample_check_count = 0;  // 抽样检查数量
-};
-
 // ============================================================================
 // EMA 活跃度估算器（用于旧词清理）
 // ============================================================================
@@ -269,9 +253,6 @@ class PredictDb : public UserDbWrapper<LevelDb> {
   bool CreateMetadata() override;
 
   // 业务方法
-  // max_candidates: 最大返回数量 (-1
-  // 表示不限制，默认不限制以确保新词有机会被看到)
-  // 注意：限制过小会导致新词即使增益提升也无法被用户看到和选择
   bool Lookup(const string& query, int max_candidates = -1);
   void Clear() { candidates_.clear(); }
 
@@ -281,11 +262,6 @@ class PredictDb : public UserDbWrapper<LevelDb> {
                      const string& word,
                      bool todelete = false);
 
-  // 迁移状态查询
-  bool IsMigrationComplete() const { return migration_complete_; }
-  void WaitForMigration(
-      std::chrono::milliseconds timeout = std::chrono::seconds(5));
-
   // 旧词清理功能
   void SetCleanupConfig(const CleanupConfig& config);
   int CleanupStaleEntries();
@@ -294,33 +270,16 @@ class PredictDb : public UserDbWrapper<LevelDb> {
   }
 
  private:
-  // 迁移相关
-  bool DetectLegacyFormat();
-  void MigrateLegacyDataInBackground();
-  MigrationStats VerifyMigration(
-      const std::vector<std::pair<string, std::vector<LegacyPrediction>>>&
-          migration_data);
-  bool BackupLegacyDb(const path& backup_path);
-  void RollbackToLegacyFormat();
-
-  // 辅助函数：检查是否是有效的预测前缀
-  static bool IsValidPredictPrefix(const string& prefix);
-
   vector<string> candidates_;
 
-  // 迁移状态
-  std::atomic<bool> migration_complete_{false};
-  std::atomic<bool> migration_in_progress_{false};
-  std::atomic<bool> migration_rollback_{false};  // 迁移失败回退标志
+  // 异步打开
+  std::thread open_thread_;
+  std::atomic<bool> ready_{false};
+  mutable std::mutex ready_mutex_;
+  std::condition_variable ready_cv_;
 
-  // 同步原语
-  mutable std::mutex migration_mutex_;
-  std::condition_variable migration_cv_;
   // 序列化写入，防止同进程多个 session 并发写导致 tick/entry 丢失
   mutable std::mutex write_mutex_;
-
-  // 后台迁移线程
-  std::thread migration_thread_;
 
   // 旧词清理相关
   ActivityEstimator activity_estimator_;
@@ -358,7 +317,7 @@ class PredictEngine : public Class<PredictEngine, const Ticket&> {
       return legacy_db_ ? legacy_db_->GetEntryText(legacy_candidates_->at[i])
                         : string();
     }
-    return candidates_.size() ? candidates_.at(i) : string();
+    return i < candidates_.size() ? candidates_[i] : string();
   }
   void UpdatePredict(const string& key, const string& word, bool todelete) {
     if (!legacy_mode_ && level_db_) {
@@ -377,9 +336,9 @@ class PredictEngine : public Class<PredictEngine, const Ticket&> {
   bool legacy_mode_ = false;
   an<PredictDb> level_db_;
   an<LegacyPredictDb> legacy_db_;
-  int max_iterations_;  // prediction times limit
-  int max_candidates_;  // prediction candidate count limit
-  string query_;        // cache last query
+  int max_iterations_;
+  int max_candidates_;
+  string query_;
   vector<string> candidates_;
   const legacy_predict::Candidates* legacy_candidates_ = nullptr;
 };

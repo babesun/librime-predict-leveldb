@@ -6,9 +6,6 @@ list(REMOVE_ITEM predict_src ${CMAKE_CURRENT_SOURCE_DIR}/src/predict_data_tool.c
 list(REMOVE_ITEM predict_src src/predict_data_tool.cc)
 list(REMOVE_ITEM predict_src predict_data_tool.cc)
 
-# msgpack (保留用于旧数据迁移)
-include_directories(deps/msgpack-c/include)
-
 add_library(rime-predict-objs OBJECT ${predict_src})
 if(BUILD_SHARED_LIBS)
   set_target_properties(rime-predict-objs
