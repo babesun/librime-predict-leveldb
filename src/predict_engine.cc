@@ -71,28 +71,111 @@ PredictEngine::PredictEngine(an<PredictDb> level_db,
       max_iterations_(max_iterations),
       max_candidates_(max_candidates) {}
 
-PredictEngine::~PredictEngine() {}
+PredictEngine::~PredictEngine() {
+  if (open_thread_.joinable()) {
+    open_thread_.join();
+  }
+}
+
+an<PredictDb> PredictEngine::GetLevelDb() const {
+  std::lock_guard<std::mutex> lock(level_db_mutex_);
+  return level_db_;
+}
+
+void PredictEngine::EnqueuePendingUpdate(const string& key,
+                                         const string& word,
+                                         bool todelete) {
+  std::lock_guard<std::mutex> lock(pending_updates_mutex_);
+  if (pending_updates_.size() >= kMaxPendingUpdates) {
+    pending_updates_.pop_front();
+  }
+  pending_updates_.push_back(PendingUpdate{key, word, todelete});
+}
+
+void PredictEngine::FlushPendingUpdates() {
+  auto db = GetLevelDb();
+  if (!db) {
+    return;
+  }
+  std::deque<PendingUpdate> pending;
+  {
+    std::lock_guard<std::mutex> lock(pending_updates_mutex_);
+    pending.swap(pending_updates_);
+  }
+  for (const auto& item : pending) {
+    db->UpdatePredict(item.key, item.word, item.todelete);
+  }
+}
 
 bool PredictEngine::EnsureDb() {
-  if (level_db_) {
+  if (legacy_mode_) {
+    return false;
+  }
+  auto state = db_init_state_.load(std::memory_order_acquire);
+  if (state == DbInitState::Ready) {
     return true;  // Already initialized
+  }
+  if (state == DbInitState::Opening) {
+    return false;
+  }
+  std::lock_guard<std::mutex> lock(db_init_mutex_);
+  state = db_init_state_.load(std::memory_order_acquire);
+  if (state == DbInitState::Ready) {
+    return true;
+  }
+  if (state == DbInitState::Opening) {
+    return false;
   }
   if (db_name_.empty()) {
     LOG(WARNING) << "PredictEngine::EnsureDb: db_name_ is empty, cannot open.";
+    db_init_state_.store(DbInitState::Failed, std::memory_order_release);
     return false;
   }
-  DLOG(INFO) << "PredictEngine::EnsureDb: opening predict db: " << db_name_;
-  the<ResourceResolver> resolver(Service::instance().CreateResourceResolver(
-      kPredictDbPredictDbResourceType));
-  auto file_path = resolver->ResolvePath(db_name_);
-  level_db_ = PredictDbManager::instance().GetPredictDb(file_path);
-  if (level_db_) {
-    level_db_->SetCleanupConfig(cleanup_config_);
-    DLOG(INFO) << "PredictEngine::EnsureDb: database opened successfully.";
-    return true;
+  if (open_thread_.joinable()) {
+    open_thread_.join();
   }
-  LOG(ERROR) << "PredictEngine::EnsureDb: failed to open: " << db_name_;
+  db_init_state_.store(DbInitState::Opening, std::memory_order_release);
+  const auto db_name_snapshot = db_name_;
+  const auto cleanup_snapshot = cleanup_config_;
+  DLOG(INFO) << "PredictEngine::EnsureDb: opening predict db asynchronously: "
+             << db_name_snapshot;
+  open_thread_ = std::thread([this, db_name_snapshot, cleanup_snapshot]() {
+    the<ResourceResolver> resolver(Service::instance().CreateResourceResolver(
+        kPredictDbPredictDbResourceType));
+    auto file_path = resolver->ResolvePath(db_name_snapshot);
+    auto opened_db = PredictDbManager::instance().GetPredictDb(file_path);
+    if (!opened_db || !opened_db->valid()) {
+      LOG(ERROR) << "PredictEngine::EnsureDb: failed to open: "
+                 << db_name_snapshot;
+      db_init_state_.store(DbInitState::Failed, std::memory_order_release);
+      return;
+    }
+    opened_db->SetCleanupConfig(cleanup_snapshot);
+    {
+      std::lock_guard<std::mutex> db_lock(level_db_mutex_);
+      level_db_ = opened_db;
+    }
+    db_init_state_.store(DbInitState::Ready, std::memory_order_release);
+    FlushPendingUpdates();
+    DLOG(INFO) << "PredictEngine::EnsureDb: database opened successfully.";
+  });
   return false;
+}
+
+void PredictEngine::UpdatePredict(const string& key,
+                                  const string& word,
+                                  bool todelete) {
+  if (legacy_mode_) {
+    return;
+  }
+  if (EnsureDb()) {
+    auto db = GetLevelDb();
+    if (db) {
+      db->UpdatePredict(key, word, todelete);
+      return;
+    }
+  }
+  EnqueuePendingUpdate(key, word, todelete);
 }
 
 bool PredictEngine::Predict(Context* ctx, const string& context_query) {
@@ -115,12 +198,14 @@ bool PredictEngine::Predict(Context* ctx, const string& context_query) {
     Clear();
     return false;
   }
-  if (!level_db_) {
-    // DB not yet opened; EnsureDb() will be called when prediction is
-    // toggled on via the option_update_notifier.
+  if (!EnsureDb()) {
     return false;
   }
-  if (level_db_->Lookup(context_query)) {
+  auto db = GetLevelDb();
+  if (!db) {
+    return false;
+  }
+  if (db->Lookup(context_query)) {
     query_ = context_query;
     DLOG(INFO) << "PredictEngine::Predict found candidates for '"
                << context_query << "'";
@@ -136,8 +221,13 @@ bool PredictEngine::Predict(Context* ctx, const string& context_query) {
 void PredictEngine::Clear() {
   DLOG(INFO) << "PredictEngine::Clear";
   query_.clear();
-  if (!legacy_mode_ && level_db_) {
-    level_db_->Clear();
+  if (legacy_mode_) {
+    legacy_candidates_ = nullptr;
+    return;
+  }
+  auto db = GetLevelDb();
+  if (db) {
+    db->Clear();
   }
   legacy_candidates_ = nullptr;
 }
@@ -155,9 +245,10 @@ an<Translation> PredictEngine::Translate(const Segment& segment) const {
   DLOG(INFO) << "PredictEngine::Translate";
   auto translation = New<FifoTranslation>();
   size_t end = segment.end;
-  if (!level_db_)
+  auto db = GetLevelDb();
+  if (!db)
     return translation;
-  auto snapshot = level_db_->GetCandidates();
+  auto snapshot = db->GetCandidates();
   int i = 0;
   for (auto predict : snapshot) {
     translation->Append(New<SimpleCandidate>("prediction", end, end, predict));

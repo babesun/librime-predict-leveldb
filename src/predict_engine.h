@@ -19,6 +19,8 @@
 #include <array>
 #include <ctime>
 #include <deque>
+#include <thread>
+#include <cstdint>
 
 namespace rime {
 
@@ -314,10 +316,10 @@ class PredictEngine : public Class<PredictEngine, const Ticket&> {
   int max_candidates() const { return max_candidates_; }
   const string& query() const { return query_; }
   int num_candidates() const {
+    auto db = GetLevelDb();
     return legacy_mode_ && legacy_candidates_
                ? static_cast<int>(legacy_candidates_->size)
-               : (level_db_ ? static_cast<int>(level_db_->GetCandidateCount())
-                            : 0);
+               : (db ? static_cast<int>(db->GetCandidateCount()) : 0);
   }
   // Thread-safe snapshot of all candidates
   vector<string> candidates_snapshot() const {
@@ -331,35 +333,56 @@ class PredictEngine : public Class<PredictEngine, const Ticket&> {
       }
       return result;
     }
-    return level_db_ ? level_db_->GetCandidates() : vector<string>();
+    auto db = GetLevelDb();
+    return db ? db->GetCandidates() : vector<string>();
   }
   string candidates(size_t i) const {
     if (legacy_mode_ && legacy_candidates_) {
       return legacy_db_ ? legacy_db_->GetEntryText(legacy_candidates_->at[i])
                         : string();
     }
-    auto snapshot = level_db_ ? level_db_->GetCandidates() : vector<string>();
+    auto db = GetLevelDb();
+    auto snapshot = db ? db->GetCandidates() : vector<string>();
     return i < snapshot.size() ? snapshot[i] : string();
   }
-  void UpdatePredict(const string& key, const string& word, bool todelete) {
-    if (!legacy_mode_ && level_db_) {
-      level_db_->UpdatePredict(key, word, todelete);
-    }
-  }
+  void UpdatePredict(const string& key, const string& word, bool todelete);
 
   // 清理配置
   void SetCleanupConfig(const CleanupConfig& config) {
-    cleanup_config_ = config;
-    if (!legacy_mode_ && level_db_) {
-      level_db_->SetCleanupConfig(config);
+    {
+      std::lock_guard<std::mutex> lock(db_init_mutex_);
+      cleanup_config_ = config;
+    }
+    if (legacy_mode_) {
+      return;
+    }
+    auto db = GetLevelDb();
+    if (db) {
+      db->SetCleanupConfig(config);
     }
   }
 
   // 延迟打开数据库（当预测从关闭变为开启时调用）
-  void SetDbName(const string& name) { db_name_ = name; }
+  void SetDbName(const string& name) {
+    std::lock_guard<std::mutex> lock(db_init_mutex_);
+    db_name_ = name;
+  }
   bool EnsureDb();
 
  private:
+  enum class DbInitState : uint8_t { Uninitialized, Opening, Ready, Failed };
+  struct PendingUpdate {
+    string key;
+    string word;
+    bool todelete;
+  };
+
+  an<PredictDb> GetLevelDb() const;
+  void EnqueuePendingUpdate(const string& key,
+                            const string& word,
+                            bool todelete);
+  void FlushPendingUpdates();
+
   bool legacy_mode_ = false;
   an<PredictDb> level_db_;
   an<LegacyPredictDb> legacy_db_;
@@ -368,6 +391,13 @@ class PredictEngine : public Class<PredictEngine, const Ticket&> {
   string query_;
   string db_name_;                // 延迟初始化用
   CleanupConfig cleanup_config_;  // 延迟初始化用
+  mutable std::mutex level_db_mutex_;
+  mutable std::mutex db_init_mutex_;
+  std::atomic<DbInitState> db_init_state_{DbInitState::Uninitialized};
+  std::thread open_thread_;
+  std::deque<PendingUpdate> pending_updates_;
+  mutable std::mutex pending_updates_mutex_;
+  static constexpr size_t kMaxPendingUpdates = 512;
   const legacy_predict::Candidates* legacy_candidates_ = nullptr;
 };
 
