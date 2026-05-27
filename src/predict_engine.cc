@@ -14,6 +14,8 @@
 #include <rime/algo/utilities.h>
 #include <rime/algo/dynamics.h>
 
+#include <thread>
+
 namespace rime {
 
 static const ResourceType kPredictDbPredictDbResourceType = {"level_predict_db",
@@ -44,6 +46,20 @@ an<PredictDb> PredictDbManager::GetPredictDb(const path& file_path) {
   return new_db;
 }
 
+void PredictDbManager::ClearCache() {
+  std::lock_guard<std::mutex> lock(mutex_);
+  // Clear expired entries; any remaining PredictDb shared_ptrs are held
+  // by active PredictEngine instances and will be cleaned up naturally.
+  for (auto it = db_cache_.begin(); it != db_cache_.end();) {
+    if (it->second.expired()) {
+      it = db_cache_.erase(it);
+    } else {
+      ++it;
+    }
+  }
+  DLOG(INFO) << "PredictDbManager cache cleared.";
+}
+
 PredictEngine::PredictEngine(an<PredictDb> level_db,
                              an<LegacyPredictDb> legacy_db,
                              bool legacy_mode,
@@ -56,6 +72,28 @@ PredictEngine::PredictEngine(an<PredictDb> level_db,
       max_candidates_(max_candidates) {}
 
 PredictEngine::~PredictEngine() {}
+
+bool PredictEngine::EnsureDb() {
+  if (level_db_) {
+    return true;  // Already initialized
+  }
+  if (db_name_.empty()) {
+    LOG(WARNING) << "PredictEngine::EnsureDb: db_name_ is empty, cannot open.";
+    return false;
+  }
+  DLOG(INFO) << "PredictEngine::EnsureDb: opening predict db: " << db_name_;
+  the<ResourceResolver> resolver(Service::instance().CreateResourceResolver(
+      kPredictDbPredictDbResourceType));
+  auto file_path = resolver->ResolvePath(db_name_);
+  level_db_ = PredictDbManager::instance().GetPredictDb(file_path);
+  if (level_db_) {
+    level_db_->SetCleanupConfig(cleanup_config_);
+    DLOG(INFO) << "PredictEngine::EnsureDb: database opened successfully.";
+    return true;
+  }
+  LOG(ERROR) << "PredictEngine::EnsureDb: failed to open: " << db_name_;
+  return false;
+}
 
 bool PredictEngine::Predict(Context* ctx, const string& context_query) {
   DLOG(INFO) << "PredictEngine::Predict ctx=" << ctx << ", context_query='"
@@ -78,14 +116,14 @@ bool PredictEngine::Predict(Context* ctx, const string& context_query) {
     return false;
   }
   if (!level_db_) {
-    LOG(WARNING) << "PredictEngine::Predict level_db_ is null";
+    // DB not yet opened; EnsureDb() will be called when prediction is
+    // toggled on via the option_update_notifier.
     return false;
   }
   if (level_db_->Lookup(context_query)) {
     query_ = context_query;
-    candidates_ = level_db_->candidates();
-    DLOG(INFO) << "PredictEngine::Predict found " << candidates_.size()
-               << " candidates for '" << context_query << "'";
+    DLOG(INFO) << "PredictEngine::Predict found candidates for '"
+               << context_query << "'";
     return true;
   } else {
     DLOG(INFO) << "PredictEngine::Predict no candidates for '" << context_query
@@ -102,7 +140,6 @@ void PredictEngine::Clear() {
     level_db_->Clear();
   }
   legacy_candidates_ = nullptr;
-  vector<string>().swap(candidates_);
 }
 
 void PredictEngine::CreatePredictSegment(Context* ctx) const {
@@ -118,8 +155,11 @@ an<Translation> PredictEngine::Translate(const Segment& segment) const {
   DLOG(INFO) << "PredictEngine::Translate";
   auto translation = New<FifoTranslation>();
   size_t end = segment.end;
+  if (!level_db_)
+    return translation;
+  auto snapshot = level_db_->GetCandidates();
   int i = 0;
-  for (auto predict : candidates_) {
+  for (auto predict : snapshot) {
     translation->Append(New<SimpleCandidate>("prediction", end, end, predict));
     i++;
     if (max_candidates_ > 0 && i >= max_candidates_)
@@ -172,39 +212,41 @@ PredictEngine* PredictEngineComponent::Create(const Ticket& ticket) {
                              max_candidates);
   }
 
-  the<ResourceResolver> resolver(Service::instance().CreateResourceResolver(
-      kPredictDbPredictDbResourceType));
-  auto file_path = resolver->ResolvePath(level_db_name);
-  an<PredictDb> level_db = PredictDbManager::instance().GetPredictDb(file_path);
+  // Always defer database open to avoid blocking the main Fcitx thread
+  // during engine/session initialization. LevelDB Open() performs file I/O
+  // and WAL replay which can take seconds on a populated database.
+  // The database will be opened lazily via EnsureDb() when prediction is
+  // first used (Predict/UpdatePredict is called).
+  an<PredictDb> level_db;
+  DLOG(INFO) << "Deferring predict database open for: " << level_db_name;
 
-  if (level_db) {
-    auto* engine = new PredictEngine(level_db, nullptr, false, max_iterations,
-                                     max_candidates);
+  auto* engine = new PredictEngine(level_db, nullptr, false, max_iterations,
+                                   max_candidates);
 
-    // 读取并设置清理配置
-    CleanupConfig cleanup_config;
-    if (auto* schema = ticket.schema) {
-      auto* config = schema->config();
-      config->GetBool("predictor/cleanup/enabled", &cleanup_config.enabled);
-      config->GetInt("predictor/cleanup/expire_days",
-                     &cleanup_config.expire_days);
-      config->GetInt("predictor/cleanup/min_usage", &cleanup_config.min_usage);
+  // Store the database name for lazy initialization (when prediction
+  // is toggled from off to on at runtime after being disabled by default)
+  engine->SetDbName(level_db_name);
 
-      DLOG(INFO) << "cleanup config: enabled=" << cleanup_config.enabled
-                 << ", expire_days=" << cleanup_config.expire_days
-                 << ", min_usage=" << cleanup_config.min_usage;
-    }
-    engine->SetCleanupConfig(cleanup_config);
+  // 读取并设置清理配置
+  CleanupConfig cleanup_config;
+  if (auto* schema = ticket.schema) {
+    auto* config = schema->config();
+    config->GetBool("predictor/cleanup/enabled", &cleanup_config.enabled);
+    config->GetInt("predictor/cleanup/expire_days",
+                   &cleanup_config.expire_days);
+    config->GetInt("predictor/cleanup/min_usage", &cleanup_config.min_usage);
 
-    return engine;
-  } else {
-    LOG(ERROR) << "failed to load predict db: " << level_db_name;
+    DLOG(INFO) << "cleanup config: enabled=" << cleanup_config.enabled
+               << ", expire_days=" << cleanup_config.expire_days
+               << ", min_usage=" << cleanup_config.min_usage;
   }
+  engine->SetCleanupConfig(cleanup_config);
 
-  return nullptr;
+  return engine;
 }
 
 an<PredictEngine> PredictEngineComponent::GetInstance(const Ticket& ticket) {
+  std::lock_guard<std::mutex> lock(cache_mutex_);
   if (Schema* schema = ticket.schema) {
     auto found = predict_engine_by_schema_id.find(schema->schema_id());
     if (found != predict_engine_by_schema_id.end()) {
@@ -221,48 +263,36 @@ an<PredictEngine> PredictEngineComponent::GetInstance(const Ticket& ticket) {
   return nullptr;
 }
 
+void PredictEngineComponent::ClearCache() {
+  std::lock_guard<std::mutex> lock(cache_mutex_);
+  predict_engine_by_schema_id.clear();
+  DLOG(INFO) << "PredictEngineComponent cache cleared.";
+}
+
 // ============================================================================
 // PredictDb 实现
 // ============================================================================
 
 PredictDb::PredictDb(const path& file_path)
     : UserDbWrapper<LevelDb>(file_path, "predict.userdb") {
-  // 异步打开：在后台线程执行 LevelDB Open，避免阻塞方案初始化
-  open_thread_ = std::thread([this]() {
-    if (!Open()) {
-      LOG(ERROR) << "Failed to open predict db: " << file_path_;
-      return;
-    }
-    string db_type;
-    if (!MetaFetch("/db_type", &db_type)) {
-      CreateMetadata();
-      DLOG(INFO) << "New predict database created (standard userdb format).";
-    } else {
-      DLOG(INFO) << "Predict database in standard userdb format.";
-    }
-    ready_ = true;
-    ready_cv_.notify_all();
-  });
+  // Synchronous open: only used when prediction is enabled by default.
+  // When disabled, the database is not opened until prediction is toggled on.
+  if (!Open()) {
+    LOG(ERROR) << "Failed to open predict db: " << file_path_;
+    return;
+  }
+  string db_type;
+  if (!MetaFetch("/db_type", &db_type)) {
+    CreateMetadata();
+    DLOG(INFO) << "New predict database created (standard userdb format).";
+  } else {
+    DLOG(INFO) << "Predict database in standard userdb format.";
+  }
 }
 
 PredictDb::~PredictDb() {
-  // 等待异步打开完成，否则 Close() 可能 crash
-  if (open_thread_.joinable()) {
-    open_thread_.join();
-  }
-
-  // 触发旧词清理
-  if (cleanup_config_.enabled && loaded()) {
-    int cleaned = CleanupStaleEntries();
-    LOG(INFO) << "PredictDb cleanup: " << cleaned << " stale entries removed";
-    LOG(INFO) << "Estimated user activity: "
-              << activity_estimator_.GetInputsPerDay() << " inputs/day";
-  }
-
-  // 等待清理完成
-  while (cleanup_in_progress_.load()) {
-    std::this_thread::sleep_for(std::chrono::milliseconds(10));
-  }
+  // Cleanup is skipped in the destructor to avoid blocking the main thread.
+  // Use explicit CleanupStaleEntries() call if needed.
 }
 
 bool PredictDb::CreateMetadata() {
@@ -279,7 +309,7 @@ bool PredictDb::CreateMetadata() {
 bool PredictDb::Lookup(const string& query, int max_candidates) {
   DLOG(INFO) << "PredictDb::Lookup query='" << query << "'";
 
-  if (!ready_.load()) {
+  if (!loaded()) {
     DLOG(INFO) << "Lookup: db not loaded yet";
     return false;
   }
@@ -365,9 +395,12 @@ bool PredictDb::Lookup(const string& query, int max_candidates) {
               return a.commits > b.commits;
             });
 
-  Clear();
-  for (const auto& e : entries) {
-    candidates_.push_back(e.w);
+  {
+    std::lock_guard<std::shared_mutex> lock(candidates_mutex_);
+    candidates_.clear();
+    for (const auto& e : entries) {
+      candidates_.push_back(e.w);
+    }
   }
 
   DLOG(INFO) << "Lookup: returning " << candidates_.size() << " candidates";
@@ -384,7 +417,7 @@ void PredictDb::UpdatePredict(const string& key,
   // 序列化写入以避免同进程并发问题
   std::lock_guard<std::mutex> write_lock(write_mutex_);
 
-  if (!ready_.load()) {
+  if (!loaded()) {
     return;
   }
 
@@ -467,8 +500,8 @@ ActivityEstimator::ActivityEstimator(double alpha)
 }
 
 void ActivityEstimator::Update(TickCount tick_diff, double hours) {
-  // 过滤异常数据（1 分钟 ~ 24 小时）
-  if (hours < 0.017 || hours > 24.0) {
+  // 过滤异常数据（NaN/inf, 1 分钟 ~ 24 小时之外）
+  if (std::isnan(hours) || std::isinf(hours) || hours < 0.017 || hours > 24.0) {
     DLOG(INFO) << "ActivityEstimator: skipped (hours=" << hours << ")";
     return;
   }
@@ -510,8 +543,6 @@ int PredictDb::CleanupStaleEntries() {
     return 0;
   }
 
-  cleanup_in_progress_ = true;
-
   // 获取当前 tick
   TickCount current_tick = 0;
   string tick_str;
@@ -547,9 +578,11 @@ int PredictDb::CleanupStaleEntries() {
   auto accessor = QueryAll();
   if (!accessor) {
     LOG(ERROR) << "CleanupStaleEntries: QueryAll failed";
-    cleanup_in_progress_ = false;
     return 0;
   }
+
+  // 使用 LevelDB 事务批量删除
+  BeginTransaction();
 
   // 批量删除（每 100 条提交一次，避免阻塞）
   constexpr int kBatchSize = 100;
@@ -606,10 +639,11 @@ int PredictDb::CleanupStaleEntries() {
     Erase(k);
   }
 
+  CommitTransaction();
+
   DLOG(INFO) << "CleanupStaleEntries: completed, "
              << "scanned=" << scanned_count << ", cleaned=" << cleaned_count;
 
-  cleanup_in_progress_ = false;
   return cleaned_count;
 }
 

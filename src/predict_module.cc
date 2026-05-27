@@ -22,7 +22,9 @@ static void rime_predict_initialize() {
 }
 
 static void rime_predict_finalize() {
-  // 无需清理
+  // 清除 singleton 缓存以释放 LevelDB 文件锁 (LOCK file)
+  // 避免 finalize() → initialize() 循环时 Open() 失败
+  PredictDbManager::instance().ClearCache();
 }
 
 RIME_REGISTER_MODULE(predict)

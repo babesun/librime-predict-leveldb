@@ -46,6 +46,7 @@ bool LegacyPredictDb::Load() {
 
   if (!metadata_->value_trie) {
     LOG(ERROR) << "legacy predict value trie not found.";
+    key_trie_->clear();  // Reset to prevent dangling array pointer
     Close();
     return false;
   }

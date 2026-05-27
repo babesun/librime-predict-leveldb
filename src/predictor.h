@@ -75,6 +75,7 @@ class Predictor : public Processor {
   connection context_update_connection_;
   connection delete_connection_;
   connection abort_connection_;
+  connection option_update_connection_;
 };
 
 class PredictorComponent : public Predictor::Component {

@@ -25,6 +25,23 @@ Predictor::Predictor(const Ticket& ticket, an<PredictEngine> predict_engine)
       [this](Context* ctx) { OnContextUpdate(ctx); });
   delete_connection_ = context->delete_notifier().connect(
       [this](Context* ctx) { OnDelete(ctx); });
+  option_update_connection_ = context->option_update_notifier().connect(
+      [this](Context* ctx, const string& option) {
+        // Lazy-open the predict DB when the user toggles prediction on.
+        // This avoids blocking the main thread during IME lifecycle events
+        // (e.g. finishComposingText on keyboard hide).
+        if (option == "prediction" && ctx->get_option("prediction") &&
+            predict_engine_) {
+          predict_engine_->EnsureDb();
+        }
+      });
+
+  // Open the predict DB immediately if prediction is already enabled
+  // (e.g. schema default). The option_update_notifier fires before the
+  // Predictor is constructed, so we missed the initial notification.
+  if (predict_engine_ && context->get_option("prediction")) {
+    predict_engine_->EnsureDb();
+  }
 
   ConnectAbortNotifier(context);
 }
@@ -49,6 +66,7 @@ Predictor::~Predictor() {
   context_update_connection_.disconnect();
   delete_connection_.disconnect();
   abort_connection_.disconnect();
+  option_update_connection_.disconnect();
 }
 
 ProcessResult Predictor::ProcessKeyEvent(const KeyEvent& key_event) {

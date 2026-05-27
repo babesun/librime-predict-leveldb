@@ -25,14 +25,14 @@ an<Translation> PredictTranslator::Query(const string& input,
   if (predict_engine_->query().empty() || !segment.HasTag("prediction")) {
     return nullptr;
   }
-  int num_candidates = predict_engine_->num_candidates();
+  auto candidates = predict_engine_->candidates_snapshot();
+  int num_candidates = static_cast<int>(candidates.size());
   if (num_candidates > 0) {
-    int max_candidates = predict_engine_->max_candidates();
     auto translation = New<FifoTranslation>();
     size_t end = segment.end;
     for (int i = 0; i < num_candidates; ++i) {
-      translation->Append(New<SimpleCandidate>("prediction", end, end,
-                                               predict_engine_->candidates(i)));
+      translation->Append(
+          New<SimpleCandidate>("prediction", end, end, candidates[i]));
     }
     return translation;
   }
