@@ -1,6 +1,7 @@
 #include "predictor.h"
 
 #include "predict_engine.h"
+#include <cstdio>
 #include <rime/candidate.h>
 #include <rime/context.h>
 #include <rime/engine.h>
@@ -73,12 +74,16 @@ ProcessResult Predictor::ProcessKeyEvent(const KeyEvent& key_event) {
   if (!engine_ || !predict_engine_)
     return kNoop;
   auto keycode = key_event.keycode();
-  if (keycode == XK_BackSpace || keycode == XK_Escape) {
+  // 单独的 Cmd(Super) 键：关闭预测窗口并清空 commit_history
+  bool is_cmd = (keycode == XK_Super_L || keycode == XK_Super_R) &&
+                (key_event.modifier() & kSuperMask) != 0;
+  if (is_cmd || keycode == XK_BackSpace || keycode == XK_Escape) {
     last_action_ = kDelete;
+    auto* ctx = engine_->context();
     predict_engine_->Clear();
     iteration_counter_ = 0;
     has_last_timed_commit_ = false;  // 清除时间戳记录
-    auto* ctx = engine_->context();
+    ctx->commit_history().clear();   // 清空已上屏历史
     if (!ctx->composition().empty() &&
         ctx->composition().back().HasTag("prediction")) {
       ctx->Clear();
