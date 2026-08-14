@@ -109,6 +109,49 @@ predictor:
 
 **修复**：在 `predictor.cc`（`OnContextUpdate`）和 `predict_engine.cc`（`UpdatePredict`）两层都加上 `key == word` 的跳过判断，源头拦截自预测记录写入。
 
+### 6. 防御 prefix/word 含空格的死数据
+
+**现象**：用户词典 `predict.userdb` 中积累大量 `prefix<空格>` 形式的死数据（实测 8751 条，占总量 48%）。这些记录占空间、拖慢 Lookup，但永远不会被命中。
+
+**根因**：
+- RIME 在用户按空格键（`XK_space`，键码 0x20）时，会通过 `commit_history` 写入一条单空格 record（见 [src/rime/commit_history.cc:25-28](https://github.com/rime/librime/blob/master/src/rime/commit_history.cc)）
+- 这导致 `last_timed_commit_.text` 末尾可能带空格
+- `predict_engine` 写入 `prefix<TAB>word` 形式的 key
+- `Lookup` 时用 `query + "\t"` 作前缀查询，`query` 不会带尾部空格 → 死数据无法被命中
+
+**修复**：
+- `OnContextUpdate` 中 `UpdatePredict` 调用前 `trim` 掉 `prefix`/`word` 前后空白字符
+- trim 后任一字段为空，或两者相等（trim 自预测），则跳过
+- 已存在的死数据需要用 `predict_data_tool` 一次性清理（见下方"清理历史死数据"）
+
+### 清理历史死数据
+
+如果之前使用过本插件，`predict.userdb` 中可能积累大量带空格的死数据。清理步骤：
+
+```bash
+# 1. 退出 Squirrel（避免 leveldb lock）
+osascript -e 'quit app "Squirrel"'
+
+# 2. 备份并导出为 txt
+cp -pR ~/Library/Rime/predict.userdb ~/Library/Rime/predict.userdb.bak
+build/plugins/librime-predict-leveldb/predict_data_tool \
+  --from leveldb --to txt \
+  --input ~/Library/Rime/predict.userdb \
+  --output /tmp/predict.txt
+
+# 3. 用 Python 清理（trim + 合并 weight + 删除自预测）
+python3 scripts/clean_predict_userdb.py /tmp/predict.txt /tmp/predict.cleaned.txt
+
+# 4. 写回 leveldb
+build/plugins/librime-predict-leveldb/predict_data_tool \
+  --from txt --to leveldb \
+  --input /tmp/predict.cleaned.txt \
+  --output ~/Library/Rime/predict.userdb
+
+# 5. 重启 Squirrel
+open -a Squirrel
+```
+
 ## Data conversion tool
 
 Build target `predict_data_tool` currently supports conversion between leveldb
