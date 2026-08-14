@@ -284,13 +284,28 @@ void Predictor::OnContextUpdate(Context* ctx) {
 
   // 只有时间间隔合理时才更新提交之间的关系
   if (should_update_relation) {
-    // 防御：跳过"前一个词 == 当前词"的自预测关系。
+    // 防御 1：trim 前后空白字符，避免产生 prefix/word 含空格的死数据。
+    // commit_history 在用户按空格键（XK_space）时会 push 一条单空格
+    // record（见 src/rime/commit_history.cc:25-28），导致 last_timed_commit_.text
+    // 末尾带空格；这种带空格的 key 永远不会被 Lookup 命中（Lookup 用
+    // "query+\t" 作前缀，query 不会带尾部空格），是垃圾数据。
+    auto trim = [](string& s) {
+      size_t a = s.find_first_not_of(" \t\r\n");
+      size_t b = s.find_last_not_of(" \t\r\n");
+      s = (a == string::npos) ? "" : s.substr(a, b - a + 1);
+    };
+    string prefix = last_timed_commit_.text;
+    string word = last_commit.text;
+    trim(prefix);
+    trim(word);
+
+    // 防御 2：trim 后任一字段为空则不建立关联。
+    // 防御 3：跳过"前一个词 == 当前词"的自预测关系。
     // 典型场景：用户删除刚上屏的字又重打一遍同样的词，会写出
     // "词\t词" 这种无意义的自预测记录，导致下次预测把刚输入的字
     // 词又弹回来。这里从源头拦截，避免污染用户词典。
-    if (last_timed_commit_.text != last_commit.text) {
-      predict_engine_->UpdatePredict(last_timed_commit_.text, last_commit.text,
-                                     false);
+    if (!prefix.empty() && !word.empty() && prefix != word) {
+      predict_engine_->UpdatePredict(prefix, word, false);
     }
   }
 
