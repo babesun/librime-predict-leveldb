@@ -1,7 +1,7 @@
 #include "predictor.h"
 
 #include "predict_engine.h"
-#include <cstdio>
+#include <string>
 #include <rime/candidate.h>
 #include <rime/context.h>
 #include <rime/engine.h>
@@ -51,6 +51,10 @@ void Predictor::OnAbort(Context* ctx) {
   if (!predict_engine_ || !ctx || !ctx->get_option("prediction")) {
     return;
   }
+  // 任何 abort 路径（ESC/BackSpace）都要清掉 shift shadow，
+  // 否则下一次预测窗弹出时残留的 shadow 会让 OnDelete 误删非 Shift 场景的候选。
+  shift_active_ = false;
+  shift_shadow_text_.clear();
   predict_engine_->Clear();
   iteration_counter_ = 0;
   has_last_timed_commit_ = false;  // 清除时间戳记录
@@ -74,10 +78,77 @@ ProcessResult Predictor::ProcessKeyEvent(const KeyEvent& key_event) {
   if (!engine_ || !predict_engine_)
     return kNoop;
   auto keycode = key_event.keycode();
-  // 单独的 Cmd(Super) 键：关闭预测窗口并清空 commit_history
+  // Shift_L/R 释放：恢复 selected_index + 清 shadow
+  // 必须在 Shift 按下分支之前判断，否则 release 事件也会被按下分支吞掉。
+  if (key_event.release() &&
+      (keycode == XK_Shift_L || keycode == XK_Shift_R)) {
+    auto* ctx = engine_->context();
+    if (!ctx->composition().empty() && shift_active_) {
+      auto& back = ctx->composition().back();
+      if (back.HasTag("prediction")) {
+        back.selected_index = 0;
+      }
+    }
+    shift_active_ = false;
+    shift_shadow_text_.clear();
+    return kNoop;
+  }
+  // Shift_L/R 按下：备份 selected_candidate text 并把 selected_index 改到越界
+  // 让 commit_text_preview 不含预测词 → Squirrel setMarkedText("") → A 键按下不 commit 预测词。
+  // menu 仍非空 → HasMenu() true → 候选窗保留。Shift+Delete 走 OnDelete 时 shadow 兜底。
+  if (!key_event.release() &&
+      (key_event.modifier() & kShiftMask) != 0 &&
+      (keycode == XK_Shift_L || keycode == XK_Shift_R)) {
+    auto* ctx = engine_->context();
+    if (!ctx->composition().empty()) {
+      auto& back = ctx->composition().back();
+      // 仅修改"零长度 + placeholder + prediction"特征段（预测段），不影响用户输入段。
+      if (back.start == back.end &&
+          back.HasTag("placeholder") &&
+          back.HasTag("prediction")) {
+        if (auto cand = back.GetSelectedCandidate()) {
+          shift_shadow_text_ = cand->text();
+          shift_active_ = true;
+        }
+        // SIZE_MAX+1 溢出为 0，Menu::Prepare(0) 是 no-op，不会浪费 CPU 拉所有候选。
+        back.selected_index = SIZE_MAX;
+      }
+    }
+    return kNoop;
+  }
+  // BackSpace 独立处理：剥 prediction 段 + return kNoop 让 key 传到 application。
+  // 这样 Squirrel 下一轮 rimeUpdate 看到 composition 空 → setMarkedText("")
+  // → Word 退出 marked-text 状态 → application 收到的 BackSpace 才能真正删字。
+  if (keycode == XK_BackSpace) {
+    auto* ctx = engine_->context();
+    last_action_ = kDelete;
+    if (!ctx->composition().empty()) {
+      auto& back = ctx->composition().back();
+      // 与 Shift 拦截分支使用相同的零长度 placeholder+prediction 段匹配模式，
+      // 避免漏掉 tag 缺失但特征匹配的边界情况。
+      if (back.start == back.end && back.HasTag("placeholder") &&
+          back.HasTag("prediction")) {
+        ctx->composition().pop_back();
+        predict_engine_->Clear();
+        iteration_counter_ = 0;
+        has_last_timed_commit_ = false;
+        ctx->commit_history().clear();
+        // 主动触发 update_notifier 让 Squirrel 立即看到 composition 变化，
+        // 下一轮 rimeUpdate 走 setMarkedText("") 退出 marked-text 状态，
+        // application 收到的 BackSpace 才能真正删字。
+        // OnContextUpdate 因 last_action_=kDelete 会直接 return，不会重建预测段。
+        self_updating_ = true;
+        ctx->update_notifier()(ctx);
+        self_updating_ = false;
+      }
+    }
+    return kNoop;  // 关键：让 BackSpace 透传到 application
+  }
+
+  // 单独的 Cmd(Super) 键 / Escape：关闭预测窗口并清空 commit_history
   bool is_cmd = (keycode == XK_Super_L || keycode == XK_Super_R) &&
                 (key_event.modifier() & kSuperMask) != 0;
-  if (is_cmd || keycode == XK_BackSpace || keycode == XK_Escape) {
+  if (is_cmd || keycode == XK_Escape) {
     last_action_ = kDelete;
     auto* ctx = engine_->context();
     predict_engine_->Clear();
@@ -113,11 +184,23 @@ void Predictor::OnDelete(Context* ctx) {
   }
   auto last_commit = ctx->commit_history().back();
   auto selected_candidate = ctx->GetSelectedCandidate();
-  if (!selected_candidate) {
+  // Shift 期间 prediction 段 selected_index 被改成 SIZE_MAX，
+  // Context::GetSelectedCandidate() 返回 null，正常路径拿不到候选。
+  // 用 Shift 按下时备份的 shadow 兜底，让 Shift+Delete 删词功能不受影响。
+  string target_text;
+  if (selected_candidate) {
+    target_text = selected_candidate->text();
+  } else if (shift_active_ && !shift_shadow_text_.empty()) {
+    target_text = shift_shadow_text_;
+  } else {
     return;
   }
-  auto current_hilited = selected_candidate->text();
-  predict_engine_->UpdatePredict(last_commit.text, current_hilited, true);
+  predict_engine_->UpdatePredict(last_commit.text, target_text, true);
+  // 用完即清，避免后续误用。
+  if (shift_active_) {
+    shift_active_ = false;
+    shift_shadow_text_.clear();
+  }
   ctx->Clear();
   ctx->update_notifier()(ctx);
 }
@@ -126,6 +209,18 @@ void Predictor::OnContextUpdate(Context* ctx) {
   if (self_updating_ || !predict_engine_ || !ctx ||
       !ctx->composition().empty() || !ctx->get_option("prediction") ||
       last_action_ == kDelete) {
+    return;
+  }
+  // 误上屏预测词清理：Shift+a 等场景下，前端把当前预测候选（type=prediction）
+  // 当作提交直接上屏，而非用户主动选词（用户选词时 last_action_==kSelect）。
+  // 此时不再重建预测窗，并清空预测状态，使预测词随本次提交上屏后即消失。
+  // 该判断不影响 Shift+Delete（last_action_==kDelete 已提前返回）。
+  if (last_action_ != kSelect && !ctx->commit_history().empty() &&
+      ctx->commit_history().back().type == "prediction") {
+    predict_engine_->Clear();
+    iteration_counter_ = 0;
+    has_last_timed_commit_ = false;  // 清除时间戳记录
+    ctx->commit_history().clear();   // 清除误提交的预测记录
     return;
   }
   if (ctx->commit_history().empty()) {
@@ -189,8 +284,14 @@ void Predictor::OnContextUpdate(Context* ctx) {
 
   // 只有时间间隔合理时才更新提交之间的关系
   if (should_update_relation) {
-    predict_engine_->UpdatePredict(last_timed_commit_.text, last_commit.text,
-                                   false);
+    // 防御：跳过"前一个词 == 当前词"的自预测关系。
+    // 典型场景：用户删除刚上屏的字又重打一遍同样的词，会写出
+    // "词\t词" 这种无意义的自预测记录，导致下次预测把刚输入的字
+    // 词又弹回来。这里从源头拦截，避免污染用户词典。
+    if (last_timed_commit_.text != last_commit.text) {
+      predict_engine_->UpdatePredict(last_timed_commit_.text, last_commit.text,
+                                     false);
+    }
   }
 
   // 更新最后一次提交记录（无论是否建立关联）

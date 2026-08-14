@@ -512,6 +512,13 @@ void PredictDb::UpdatePredict(const string& key,
     return;
   }
 
+  // 防御：跳过"前缀 == 预测词"的自预测关系。
+  // 兜底保护（predictor.cc 调用处已有同样判断）：避免同一字词
+  // 连续提交时写入无意义的"词\t词"记录，防止下次预测把自己弹回。
+  if (!todelete && key == word) {
+    return;
+  }
+
   // 新格式：key="prefix\tpredict_word"
   string new_key = key + "\t" + word;
 

@@ -70,6 +70,16 @@ class Predictor : public Processor {
   int max_commit_interval_seconds_ = 30;  // 默认 30 秒，设为 0 可禁用
   bool legacy_mode_ = false;
 
+  // Shift 按下时：备份当前 selected_candidate.text 并把 selected_index 改到越界，
+  // 让 Composition::GetCommitText() 拿不到预测词，从而 commit_text_preview 为空，
+  // Squirrel 的 setMarkedText("") 在 A 键按下前清空 marked text，
+  // Cocoa 协议不会把预测词误上屏。
+  // Shift 释放时：恢复 selected_index 并清 shadow。
+  // 候选窗由 Context::HasMenu() 判断，依赖 menu 是否非空，与 selected_index 解耦，
+  // 所以本方案能让"候选窗保留 + commit_text_preview 为空 + Shift+Delete 删词可走 shadow 兜底"三者同时成立。
+  bool shift_active_ = false;
+  string shift_shadow_text_;
+
   an<PredictEngine> predict_engine_;
   connection select_connection_;
   connection context_update_connection_;
